@@ -24,6 +24,55 @@ def resolve_project_path(path_value: str, project_root: str) -> str:
     return os.path.normpath(os.path.join(project_root, path_value))
 
 
+def validate_thermal_power_layer(thermal_config: Dict[str, Any], config_file: str) -> None:
+    """Validate that the configured thermal power layer exists and accepts power."""
+    geometry_file = thermal_config['geometry_file']
+    power_layer = thermal_config['power_layer']
+
+    with open(geometry_file, 'r') as f:
+        geometry_config = yaml.safe_load(f)
+
+    if not isinstance(geometry_config, dict):
+        raise ValueError(
+            f"Invalid thermal geometry file in {config_file}.\n"
+            f"Expected YAML mapping in: {geometry_file}"
+        )
+
+    layers = geometry_config.get('layers')
+    if not isinstance(layers, dict):
+        raise ValueError(
+            f"Invalid thermal geometry file in {config_file}.\n"
+            f"Expected 'layers' mapping in: {geometry_file}"
+        )
+
+    if power_layer not in layers:
+        available_layers = ', '.join(str(layer_name) for layer_name in layers.keys())
+        raise ValueError(
+            f"Invalid thermal configuration in {config_file}.\n"
+            f"'post_processing.thermal.power_layer' not found in geometry file.\n"
+            f"Requested layer: {power_layer}\n"
+            f"Geometry file: {geometry_file}\n"
+            f"Available layers: {available_layers}"
+        )
+
+    layer_config = layers[power_layer]
+    if not isinstance(layer_config, dict):
+        raise ValueError(
+            f"Invalid thermal geometry file in {config_file}.\n"
+            f"Layer '{power_layer}' must be a mapping in: {geometry_file}"
+        )
+
+    if layer_config.get('power_src') is not True:
+        raise ValueError(
+            f"Invalid thermal configuration in {config_file}.\n"
+            f"'post_processing.thermal.power_layer' must reference a geometry layer "
+            f"with power_src: True.\n"
+            f"Requested layer: {power_layer}\n"
+            f"Geometry file: {geometry_file}\n"
+            f"Current power_src value: {layer_config.get('power_src')!r}"
+        )
+
+
 def validate_and_resolve_thermal_config(
     config: Dict[str, Any],
     config_file: str,
@@ -88,6 +137,8 @@ def validate_and_resolve_thermal_config(
                 f"Key: post_processing.thermal.{key}\n"
                 f"Path: {resolved_path}"
             )
+
+    validate_thermal_power_layer(thermal_config, config_file)
 
 
 def validate_config_structure(config: Dict[str, Any], config_file: str) -> None:
