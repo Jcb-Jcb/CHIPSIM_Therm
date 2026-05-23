@@ -60,3 +60,35 @@ post_processing:
   # Output generation
   generate_plots: true           # Generate utilization, power plots
   generate_visualizations: true # Generate network mapping visualizations
+
+  # Thermal modeling (opt-in)
+  thermal:
+    enabled: false
+
+    # Required when enabled: physical model inputs.
+    geometry_file: "integrations/thermal_model/<your_geometry>.yml"
+    material_prop_file: "integrations/thermal_model/<your_materials>.yml"
+
+    # Required in v1: physical chiplet/block layout for the thermal model.
+    power_config_file: "integrations/thermal_model/<your_power_config>.yml"
+
+    # Required in v1: thermal layer that receives chiplet power.
+    power_layer: "<layer_name_in_geometry_layers>"
+
+    # V1 power mapping mode.
+    granularity: "chiplet_total"
+
+    # Thermal simulation controls.
+    simulation_type: "transient"
+    time_step_s: null
+    power_interval_s: null
+    total_duration_s: null
+
+    # Outputs.
+    generate_heatmap: true
+    time_heatmap_s: null
+    generate_DSS: false
+    use_tuned_C: true
+
+    # Failure handling.
+    fail_on_error: true
