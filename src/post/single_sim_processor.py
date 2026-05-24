@@ -381,6 +381,12 @@ class SingleSimProcessor:
             )
             self.thermal_adapter_result = adapter.prepare_inputs()
         except ThermalAdapterError as exc:
+            self._write_thermal_summary(
+                status='FAILED',
+                thermal_config=thermal_config,
+                wall_clock_runtime_s=0.0,
+                error_message=str(exc),
+            )
             if thermal_config.get('fail_on_error', True):
                 raise
             print(f"⚠️  Thermal input generation failed: {exc}")
@@ -393,9 +399,60 @@ class SingleSimProcessor:
         """Invoke thermal_RC.py with generated CHIPSIM thermal inputs."""
         command = self._build_thermal_command(thermal_config)
         thermal_model_dir = os.path.join(os.getcwd(), 'integrations', 'thermal_model')
+        log_path = self._thermal_log_file()
+        start_time = time.time()
 
         print("🌡️  Running thermal solver...")
-        subprocess.run(command, cwd=thermal_model_dir, check=True)
+        try:
+            os.makedirs(self._thermal_output_dir(), exist_ok=True)
+            with open(log_path, 'w') as log_file:
+                log_file.write('CHIPSIM thermal solver invocation\n')
+                log_file.write(f"Working directory: {thermal_model_dir}\n")
+                log_file.write(f"Command: {' '.join(command)}\n\n")
+                log_file.flush()
+                subprocess.run(
+                    command,
+                    cwd=thermal_model_dir,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    check=True,
+                )
+        except subprocess.CalledProcessError as exc:
+            runtime_s = time.time() - start_time
+            error_message = f"Thermal solver failed with exit code {exc.returncode}."
+            self._write_thermal_summary(
+                status='FAILED',
+                thermal_config=thermal_config,
+                wall_clock_runtime_s=runtime_s,
+                error_message=error_message,
+                log_path=log_path,
+            )
+            if thermal_config.get('fail_on_error', True):
+                raise
+            print(f"⚠️  {error_message} See: {log_path}")
+            return
+        except OSError as exc:
+            runtime_s = time.time() - start_time
+            error_message = f"Failed to start thermal solver: {exc}"
+            self._write_thermal_summary(
+                status='FAILED',
+                thermal_config=thermal_config,
+                wall_clock_runtime_s=runtime_s,
+                error_message=error_message,
+                log_path=log_path,
+            )
+            if thermal_config.get('fail_on_error', True):
+                raise
+            print(f"⚠️  {error_message}")
+            return
+
+        runtime_s = time.time() - start_time
+        self._write_thermal_summary(
+            status='SUCCESS',
+            thermal_config=thermal_config,
+            wall_clock_runtime_s=runtime_s,
+            log_path=log_path,
+        )
         print("✅ Thermal solver completed")
 
     def _build_thermal_command(self, thermal_config):
@@ -425,6 +482,133 @@ class SingleSimProcessor:
             '--generate_DSS', self._thermal_bool_arg(thermal_config.get('generate_DSS', False)),
             '--use_tuned_C', self._thermal_bool_arg(thermal_config.get('use_tuned_C', True)),
         ]
+
+    def _write_thermal_summary(
+        self,
+        status,
+        thermal_config,
+        wall_clock_runtime_s,
+        error_message=None,
+        log_path=None,
+    ):
+        """Write a compact thermal run summary for CHIPSIM artifacts."""
+        thermal_output_dir = self._thermal_output_dir()
+        os.makedirs(thermal_output_dir, exist_ok=True)
+        summary_path = self._thermal_summary_file()
+        kpis = self._collect_thermal_kpis()
+        log_path = log_path or self._thermal_log_file()
+
+        with open(summary_path, 'w') as f:
+            f.write('CHIPSIM Thermal Summary\n')
+            f.write('=======================\n')
+            f.write(f"Status: {status}\n")
+            f.write(f"Thermal output directory: {thermal_output_dir}\n")
+            f.write(f"Thermal log: {log_path}\n")
+            f.write(f"Wall-clock runtime (s): {wall_clock_runtime_s:.6f}\n")
+            f.write(f"Simulation type: {thermal_config.get('simulation_type', 'transient')}\n")
+            f.write(f"Generated heatmaps: {thermal_config.get('generate_heatmap', True)}\n")
+            f.write(f"Generated DSS matrices: {thermal_config.get('generate_DSS', False)}\n")
+
+            if error_message:
+                f.write(f"Error: {error_message}\n")
+                error_snippet = self._read_file_tail(log_path)
+                if error_snippet:
+                    f.write('\nError log tail:\n')
+                    f.write(error_snippet)
+                    if not error_snippet.endswith('\n'):
+                        f.write('\n')
+
+            f.write('\nThermal KPIs\n')
+            f.write('------------\n')
+            self._write_temperature_summary_line(f, 'Global peak temperature', kpis.get('global_peak_temperature_k'))
+            self._write_temperature_summary_line(f, 'Final timestep peak temperature', kpis.get('final_timestep_peak_temperature_k'))
+            self._write_temperature_summary_line(f, 'Per-timestep global peak min', kpis.get('timestep_global_peak_min_k'))
+            self._write_temperature_summary_line(f, 'Per-timestep global peak avg', kpis.get('timestep_global_peak_avg_k'))
+            self._write_temperature_summary_line(f, 'Per-timestep global peak max', kpis.get('timestep_global_peak_max_k'))
+
+            f.write('\nDerived max_power_w by chiplet\n')
+            f.write('------------------------------\n')
+            for chiplet_id, max_power_w in self._sorted_max_power_items():
+                f.write(f"chiplet_{chiplet_id}: {float(max_power_w):.12g} W\n")
+
+            f.write('\nZero-power chiplets\n')
+            f.write('-------------------\n')
+            zero_power_chiplets = self._zero_power_chiplets()
+            if zero_power_chiplets:
+                for chiplet_id in zero_power_chiplets:
+                    f.write(f"chiplet_{chiplet_id}\n")
+            else:
+                f.write('None\n')
+
+            f.write('\nFile pointers\n')
+            f.write('-------------\n')
+            self._write_optional_file_pointer(f, 'Power sequence', self._adapter_attr('power_sequence_file'))
+            self._write_optional_file_pointer(f, 'Resolved power config', self._adapter_attr('resolved_power_config_file'))
+            self._write_optional_file_pointer(f, 'Adapter metadata', self._adapter_attr('adapter_metadata_file'))
+            self._write_optional_file_pointer(f, 'Floorplan directory', os.path.join(thermal_output_dir, 'floorplan'))
+            self._write_optional_file_pointer(f, 'Heatmaps directory', os.path.join(thermal_output_dir, 'heatmaps'))
+            self._write_optional_file_pointer(f, 'Thermal output directory', os.path.join(thermal_output_dir, 'output'))
+            self._write_file_list(f, 'Temperature files', kpis.get('temperature_files', []))
+            self._write_file_list(f, 'Heatmap files', kpis.get('heatmap_files', []))
+            self._write_file_list(f, 'DSS matrix files', kpis.get('dss_matrix_files', []))
+
+    def _collect_thermal_kpis(self):
+        """Collect temperature KPIs and thermal-native output file pointers."""
+        thermal_output_dir = self._thermal_output_dir()
+        output_dir = os.path.join(thermal_output_dir, 'output')
+        temperature_files = sorted(glob.glob(os.path.join(output_dir, 'temperature_all_*.csv')))
+        heatmap_files = sorted(glob.glob(os.path.join(thermal_output_dir, 'heatmaps', '*.png')))
+        dss_matrix_files = [
+            path for path in [
+                os.path.join(output_dir, 'disc_A_matrix.csv'),
+                os.path.join(output_dir, 'disc_B_matrix.csv'),
+            ]
+            if os.path.exists(path)
+        ]
+
+        global_peak = None
+        final_timestep_peak = None
+        timestep_peaks = []
+
+        for temperature_file in temperature_files:
+            try:
+                temperature_data = np.loadtxt(temperature_file, delimiter=',')
+            except (OSError, ValueError):
+                continue
+
+            if temperature_data.size == 0:
+                continue
+
+            temperature_data = np.atleast_2d(temperature_data)
+            finite_temperatures = temperature_data[np.isfinite(temperature_data)]
+            if finite_temperatures.size == 0:
+                continue
+
+            file_peak = float(np.max(finite_temperatures))
+            global_peak = file_peak if global_peak is None else max(global_peak, file_peak)
+
+            file_timestep_peaks = np.nanmax(temperature_data, axis=1)
+            file_timestep_peaks = file_timestep_peaks[np.isfinite(file_timestep_peaks)]
+            if file_timestep_peaks.size > 0:
+                timestep_peaks.extend(float(value) for value in file_timestep_peaks)
+                final_timestep_peak = float(file_timestep_peaks[-1])
+
+        kpis = {
+            'temperature_files': temperature_files,
+            'heatmap_files': heatmap_files,
+            'dss_matrix_files': dss_matrix_files,
+            'global_peak_temperature_k': global_peak,
+            'final_timestep_peak_temperature_k': final_timestep_peak,
+        }
+
+        if timestep_peaks:
+            kpis.update({
+                'timestep_global_peak_min_k': float(np.min(timestep_peaks)),
+                'timestep_global_peak_avg_k': float(np.mean(timestep_peaks)),
+                'timestep_global_peak_max_k': float(np.max(timestep_peaks)),
+            })
+
+        return kpis
 
     def _thermal_time_step_s(self, thermal_config):
         value = thermal_config.get('time_step_s')
@@ -456,10 +640,75 @@ class SingleSimProcessor:
             return len(trace)
         return 0
 
+    def _thermal_output_dir(self):
+        if self.thermal_adapter_result is not None:
+            return self.thermal_adapter_result.thermal_output_dir
+        return os.path.join(self.formatted_results_dir, 'thermal')
+
+    def _thermal_log_file(self):
+        return os.path.join(self._thermal_output_dir(), 'thermal.log')
+
+    def _thermal_summary_file(self):
+        return os.path.join(self._thermal_output_dir(), 'thermal_summary.txt')
+
+    def _adapter_attr(self, attr_name):
+        if self.thermal_adapter_result is None:
+            return None
+        return getattr(self.thermal_adapter_result, attr_name, None)
+
+    def _sorted_max_power_items(self):
+        if self.thermal_adapter_result is None:
+            return []
+        items = self.thermal_adapter_result.max_power_w_by_chiplet.items()
+        return sorted(items, key=lambda item: self._chiplet_sort_key(item[0]))
+
+    def _zero_power_chiplets(self):
+        if self.thermal_adapter_result is None:
+            return []
+        return sorted(self.thermal_adapter_result.zero_power_chiplets, key=self._chiplet_sort_key)
+
+    @staticmethod
+    def _chiplet_sort_key(chiplet_id):
+        try:
+            return (0, int(chiplet_id))
+        except (TypeError, ValueError):
+            return (1, str(chiplet_id))
+
     @staticmethod
     def _thermal_bool_arg(value):
+        if isinstance(value, str):
+            return 'true' if value.lower() in ('true', '1', 'yes') else 'false'
         return 'true' if bool(value) else 'false'
-    
+
+    @staticmethod
+    def _write_temperature_summary_line(summary_file, label, value_k):
+        if value_k is None:
+            summary_file.write(f"{label}: unavailable\n")
+            return
+        summary_file.write(f"{label}: {value_k:.6f} K ({value_k - 273.15:.6f} C)\n")
+
+    @staticmethod
+    def _write_optional_file_pointer(summary_file, label, path):
+        if path:
+            summary_file.write(f"{label}: {path}\n")
+
+    @staticmethod
+    def _write_file_list(summary_file, label, paths):
+        summary_file.write(f"{label}:\n")
+        if paths:
+            for path in paths:
+                summary_file.write(f"  {path}\n")
+        else:
+            summary_file.write('  None\n')
+
+    @staticmethod
+    def _read_file_tail(path, max_chars=2000):
+        if not path or not os.path.exists(path):
+            return ''
+        with open(path, 'r', errors='replace') as f:
+            content = f.read()
+        return content[-max_chars:]
+
     def _generate_plots(self):
         """Generate plots from the simulation results."""
         print("\n📊 Generating plots...")
