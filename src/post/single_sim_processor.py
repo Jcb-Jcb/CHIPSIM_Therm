@@ -387,7 +387,18 @@ class SingleSimProcessor:
                 wall_clock_runtime_s=0.0,
                 error_message=str(exc),
             )
-            if thermal_config.get('fail_on_error', True):
+            if self._thermal_fail_on_error(thermal_config):
+                raise
+            print(f"⚠️  Thermal input generation failed: {exc}")
+            return
+        except Exception as exc:
+            self._write_thermal_summary(
+                status='FAILED',
+                thermal_config=thermal_config,
+                wall_clock_runtime_s=0.0,
+                error_message=f"Thermal input generation failed: {exc}",
+            )
+            if self._thermal_fail_on_error(thermal_config):
                 raise
             print(f"⚠️  Thermal input generation failed: {exc}")
             return
@@ -397,13 +408,13 @@ class SingleSimProcessor:
 
     def _invoke_thermal_solver(self, thermal_config):
         """Invoke thermal_RC.py with generated CHIPSIM thermal inputs."""
-        command = self._build_thermal_command(thermal_config)
         thermal_model_dir = os.path.join(os.getcwd(), 'integrations', 'thermal_model')
         log_path = self._thermal_log_file()
         start_time = time.time()
 
         print("🌡️  Running thermal solver...")
         try:
+            command = self._build_thermal_command(thermal_config)
             os.makedirs(self._thermal_output_dir(), exist_ok=True)
             with open(log_path, 'w') as log_file:
                 log_file.write('CHIPSIM thermal solver invocation\n')
@@ -427,7 +438,7 @@ class SingleSimProcessor:
                 error_message=error_message,
                 log_path=log_path,
             )
-            if thermal_config.get('fail_on_error', True):
+            if self._thermal_fail_on_error(thermal_config):
                 raise
             print(f"⚠️  {error_message} See: {log_path}")
             return
@@ -441,7 +452,21 @@ class SingleSimProcessor:
                 error_message=error_message,
                 log_path=log_path,
             )
-            if thermal_config.get('fail_on_error', True):
+            if self._thermal_fail_on_error(thermal_config):
+                raise
+            print(f"⚠️  {error_message}")
+            return
+        except Exception as exc:
+            runtime_s = time.time() - start_time
+            error_message = f"Thermal execution failed: {exc}"
+            self._write_thermal_summary(
+                status='FAILED',
+                thermal_config=thermal_config,
+                wall_clock_runtime_s=runtime_s,
+                error_message=error_message,
+                log_path=log_path,
+            )
+            if self._thermal_fail_on_error(thermal_config):
                 raise
             print(f"⚠️  {error_message}")
             return
@@ -508,6 +533,7 @@ class SingleSimProcessor:
             f.write(f"Simulation type: {thermal_config.get('simulation_type', 'transient')}\n")
             f.write(f"Generated heatmaps: {thermal_config.get('generate_heatmap', True)}\n")
             f.write(f"Generated DSS matrices: {thermal_config.get('generate_DSS', False)}\n")
+            f.write(f"Fail on error: {self._thermal_fail_on_error(thermal_config)}\n")
 
             if error_message:
                 f.write(f"Error: {error_message}\n")
@@ -674,11 +700,18 @@ class SingleSimProcessor:
         except (TypeError, ValueError):
             return (1, str(chiplet_id))
 
+    def _thermal_fail_on_error(self, thermal_config):
+        return self._thermal_bool_value(thermal_config.get('fail_on_error', True))
+
+    @staticmethod
+    def _thermal_bool_value(value):
+        if isinstance(value, str):
+            return value.lower() in ('true', '1', 'yes')
+        return bool(value)
+
     @staticmethod
     def _thermal_bool_arg(value):
-        if isinstance(value, str):
-            return 'true' if value.lower() in ('true', '1', 'yes') else 'false'
-        return 'true' if bool(value) else 'false'
+        return 'true' if SingleSimProcessor._thermal_bool_value(value) else 'false'
 
     @staticmethod
     def _write_temperature_summary_line(summary_file, label, value_k):
