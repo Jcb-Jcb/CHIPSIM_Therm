@@ -5,6 +5,7 @@ import csv
 import glob
 import os
 import pickle
+import subprocess
 import sys
 import time
 
@@ -386,6 +387,78 @@ class SingleSimProcessor:
             return
 
         print(f"✅ Thermal inputs prepared in: {self.thermal_adapter_result.thermal_output_dir}")
+        self._invoke_thermal_solver(thermal_config)
+
+    def _invoke_thermal_solver(self, thermal_config):
+        """Invoke thermal_RC.py with generated CHIPSIM thermal inputs."""
+        command = self._build_thermal_command(thermal_config)
+        thermal_model_dir = os.path.join(os.getcwd(), 'integrations', 'thermal_model')
+
+        print("🌡️  Running thermal solver...")
+        subprocess.run(command, cwd=thermal_model_dir, check=True)
+        print("✅ Thermal solver completed")
+
+    def _build_thermal_command(self, thermal_config):
+        """Build the thermal_RC.py subprocess command without shell interpolation."""
+        thermal_model_dir = os.path.join(os.getcwd(), 'integrations', 'thermal_model')
+        thermal_script = os.path.join(thermal_model_dir, 'thermal_RC.py')
+
+        time_step_s = self._thermal_time_step_s(thermal_config)
+        power_interval_s = self._thermal_power_interval_s(thermal_config, time_step_s)
+        total_duration_s = self._thermal_total_duration_s(thermal_config, power_interval_s)
+        time_heatmap_s = self._thermal_time_heatmap_s(thermal_config, total_duration_s)
+
+        return [
+            sys.executable,
+            thermal_script,
+            '--material_prop_file', str(thermal_config['material_prop_file']),
+            '--geometry_file', str(thermal_config['geometry_file']),
+            '--power_config_file', str(self.thermal_adapter_result.resolved_power_config_file),
+            '--power_seq_file', str(self.thermal_adapter_result.power_sequence_file),
+            '--output_dir', str(self.thermal_adapter_result.thermal_output_dir),
+            '--simulation_type', str(thermal_config.get('simulation_type', 'transient')),
+            '--time_step', str(time_step_s),
+            '--power_interval', str(power_interval_s),
+            '--total_duration', str(total_duration_s),
+            '--time_heatmap', str(time_heatmap_s),
+            '--generate_heatmap', self._thermal_bool_arg(thermal_config.get('generate_heatmap', True)),
+            '--generate_DSS', self._thermal_bool_arg(thermal_config.get('generate_DSS', False)),
+            '--use_tuned_C', self._thermal_bool_arg(thermal_config.get('use_tuned_C', True)),
+        ]
+
+    def _thermal_time_step_s(self, thermal_config):
+        value = thermal_config.get('time_step_s')
+        if value is not None:
+            return float(value)
+        return float(self.gm.time_step_us) * 1e-6
+
+    def _thermal_power_interval_s(self, thermal_config, time_step_s):
+        value = thermal_config.get('power_interval_s')
+        if value is not None:
+            return float(value)
+        return time_step_s
+
+    def _thermal_total_duration_s(self, thermal_config, power_interval_s):
+        value = thermal_config.get('total_duration_s')
+        if value is not None:
+            return float(value)
+        return self._num_power_time_points() * power_interval_s
+
+    def _thermal_time_heatmap_s(self, thermal_config, total_duration_s):
+        value = thermal_config.get('time_heatmap_s')
+        if value is not None:
+            return float(value)
+        return total_duration_s
+
+    def _num_power_time_points(self):
+        power_traces = self.metric_computer.chiplet_total_power_over_time or {}
+        for trace in power_traces.values():
+            return len(trace)
+        return 0
+
+    @staticmethod
+    def _thermal_bool_arg(value):
+        return 'true' if bool(value) else 'false'
     
     def _generate_plots(self):
         """Generate plots from the simulation results."""
