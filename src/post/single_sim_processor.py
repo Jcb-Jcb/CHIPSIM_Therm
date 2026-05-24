@@ -499,6 +499,7 @@ class SingleSimProcessor:
             '--power_seq_file', str(self.thermal_adapter_result.power_sequence_file),
             '--output_dir', str(self.thermal_adapter_result.thermal_output_dir),
             '--simulation_type', str(thermal_config.get('simulation_type', 'transient')),
+            '--is_homogeneous', self._thermal_bool_arg(thermal_config.get('is_homogeneous', False)),
             '--time_step', str(time_step_s),
             '--power_interval', str(power_interval_s),
             '--total_duration', str(total_duration_s),
