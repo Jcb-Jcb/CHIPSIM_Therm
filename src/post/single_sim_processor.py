@@ -13,6 +13,7 @@ import numpy as np
 from src.post.metrics import MetricComputer, MetricFormatter
 from src.post.output_manager import OutputManager
 from src.post.simulation_plotter import SimulationPlotter
+from src.post.thermal_adapter import ThermalAdapter, ThermalAdapterError
 from src.post.visualize_mapping import ChipletVisualizer
 
 
@@ -58,6 +59,7 @@ class SingleSimProcessor:
         self.gm = None
         self.formatted_results_dir = None
         self.metric_computer = None
+        self.thermal_adapter_result = None
         
     def process(self):
         """
@@ -93,6 +95,9 @@ class SingleSimProcessor:
         
         # Save power data
         self._save_power_data()
+
+        # Run thermal integration once formatted output and power metrics exist
+        self._run_thermal_if_enabled()
         
         # Generate plots
         if self.generate_plots:
@@ -358,6 +363,29 @@ class SingleSimProcessor:
                 writer.writerow([chiplet_name] + list(power_percentages))
         
         print(f"✅ Power data saved to: {power_csv_path}")
+
+    def _run_thermal_if_enabled(self):
+        """Prepare thermal-model inputs when post-processing thermal output is enabled."""
+        thermal_config = self.processing_config.get('thermal', {})
+        if not isinstance(thermal_config, dict) or not thermal_config.get('enabled', False):
+            return
+
+        print("\n🌡️  Preparing thermal model inputs...")
+        try:
+            adapter = ThermalAdapter.from_metric_computer(
+                formatted_results_dir=self.formatted_results_dir,
+                time_step_us=self.gm.time_step_us,
+                metric_computer=self.metric_computer,
+                thermal_config=thermal_config,
+            )
+            self.thermal_adapter_result = adapter.prepare_inputs()
+        except ThermalAdapterError as exc:
+            if thermal_config.get('fail_on_error', True):
+                raise
+            print(f"⚠️  Thermal input generation failed: {exc}")
+            return
+
+        print(f"✅ Thermal inputs prepared in: {self.thermal_adapter_result.thermal_output_dir}")
     
     def _generate_plots(self):
         """Generate plots from the simulation results."""
