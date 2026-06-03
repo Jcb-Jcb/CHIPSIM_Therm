@@ -5,6 +5,7 @@ import csv
 import glob
 import os
 import pickle
+import signal
 import subprocess
 import sys
 import time
@@ -430,7 +431,7 @@ class SingleSimProcessor:
                 )
         except subprocess.CalledProcessError as exc:
             runtime_s = time.time() - start_time
-            error_message = f"Thermal solver failed with exit code {exc.returncode}."
+            error_message = f"Thermal solver failed with exit code {self._format_subprocess_returncode(exc.returncode)}."
             self._write_thermal_summary(
                 status='FAILED',
                 thermal_config=thermal_config,
@@ -485,10 +486,7 @@ class SingleSimProcessor:
         thermal_model_dir = os.path.join(os.getcwd(), 'integrations', 'thermal_model')
         thermal_script = os.path.join(thermal_model_dir, 'thermal_RC.py')
 
-        time_step_s = self._thermal_time_step_s(thermal_config)
-        power_interval_s = self._thermal_power_interval_s(thermal_config, time_step_s)
-        total_duration_s = self._thermal_total_duration_s(thermal_config, power_interval_s)
-        time_heatmap_s = self._thermal_time_heatmap_s(thermal_config, total_duration_s)
+        time_controls = self._thermal_time_controls(thermal_config)
 
         return [
             sys.executable,
@@ -500,10 +498,11 @@ class SingleSimProcessor:
             '--output_dir', str(self.thermal_adapter_result.thermal_output_dir),
             '--simulation_type', str(thermal_config.get('simulation_type', 'transient')),
             '--is_homogeneous', self._thermal_bool_arg(thermal_config.get('is_homogeneous', False)),
-            '--time_step', str(time_step_s),
-            '--power_interval', str(power_interval_s),
-            '--total_duration', str(total_duration_s),
-            '--time_heatmap', str(time_heatmap_s),
+            '--time_step', str(time_controls['time_step_s']),
+            '--power_interval', str(time_controls['power_interval_s']),
+            '--total_duration', str(time_controls['total_duration_s']),
+            '--max_native_steps', str(time_controls['max_native_steps']),
+            '--time_heatmap', str(time_controls['time_heatmap_s']),
             '--generate_heatmap', self._thermal_bool_arg(thermal_config.get('generate_heatmap', True)),
             '--generate_DSS', self._thermal_bool_arg(thermal_config.get('generate_DSS', False)),
             '--use_tuned_C', self._thermal_bool_arg(thermal_config.get('use_tuned_C', True)),
@@ -535,6 +534,12 @@ class SingleSimProcessor:
             f.write(f"Generated heatmaps: {thermal_config.get('generate_heatmap', True)}\n")
             f.write(f"Generated DSS matrices: {thermal_config.get('generate_DSS', False)}\n")
             f.write(f"Fail on error: {self._thermal_fail_on_error(thermal_config)}\n")
+            time_controls = self._thermal_time_controls(thermal_config)
+            f.write(f"Thermal time step (s): {time_controls['time_step_s']}\n")
+            f.write(f"Thermal power interval (s): {time_controls['power_interval_s']}\n")
+            f.write(f"Thermal total duration (s): {time_controls['total_duration_s']}\n")
+            f.write(f"Thermal heatmap time (s): {time_controls['time_heatmap_s']}\n")
+            f.write(f"Max native steps: {time_controls['max_native_steps']}\n")
 
             if error_message:
                 f.write(f"Error: {error_message}\n")
@@ -637,6 +642,20 @@ class SingleSimProcessor:
 
         return kpis
 
+    def _thermal_time_controls(self, thermal_config):
+        time_step_s = self._thermal_time_step_s(thermal_config)
+        power_interval_s = self._thermal_power_interval_s(thermal_config, time_step_s)
+        total_duration_s = self._thermal_total_duration_s(thermal_config, power_interval_s)
+        time_heatmap_s = self._thermal_time_heatmap_s(thermal_config, total_duration_s)
+        max_native_steps = self._thermal_max_native_steps(thermal_config)
+        return {
+            'time_step_s': time_step_s,
+            'power_interval_s': power_interval_s,
+            'total_duration_s': total_duration_s,
+            'time_heatmap_s': time_heatmap_s,
+            'max_native_steps': max_native_steps,
+        }
+
     def _thermal_time_step_s(self, thermal_config):
         value = thermal_config.get('time_step_s')
         if value is not None:
@@ -660,6 +679,15 @@ class SingleSimProcessor:
         if value is not None:
             return float(value)
         return total_duration_s
+
+    def _thermal_max_native_steps(self, thermal_config):
+        value = thermal_config.get('max_native_steps', 256)
+        if value is None:
+            return 256
+        value = int(value)
+        if value < 0:
+            raise ValueError(f'max_native_steps must be non-negative, got {value}')
+        return value
 
     def _num_power_time_points(self):
         power_traces = self.metric_computer.chiplet_total_power_over_time or {}
@@ -703,6 +731,17 @@ class SingleSimProcessor:
 
     def _thermal_fail_on_error(self, thermal_config):
         return self._thermal_bool_value(thermal_config.get('fail_on_error', True))
+
+    @staticmethod
+    def _format_subprocess_returncode(returncode):
+        if returncode is not None and returncode < 0:
+            signum = -returncode
+            try:
+                signame = signal.Signals(signum).name
+            except ValueError:
+                signame = f'signal {signum}'
+            return f'{returncode} ({signame})'
+        return str(returncode)
 
     @staticmethod
     def _thermal_bool_value(value):

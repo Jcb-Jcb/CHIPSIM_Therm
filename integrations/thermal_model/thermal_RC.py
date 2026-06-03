@@ -19,6 +19,7 @@ def parse_args():
     parser.add_argument('--time_step', type=float, default=0.1, help='Time step for transient simulation in sec')
     parser.add_argument('--power_interval', type=float, default=1, help='Power interval for transient simulation in sec')
     parser.add_argument('--total_duration', type=float, default=24, help='Total time for transient simulation in sec')
+    parser.add_argument('--max_native_steps', type=int, default=256, help='Maximum transient steps per native solver call; 0 disables chunking')
 
     parser.add_argument('--use_tuned_C', type=lambda x: (str(x).lower() in ['true','1', 'yes']), default=True, help='Use tuned C matrix for simulation')
 

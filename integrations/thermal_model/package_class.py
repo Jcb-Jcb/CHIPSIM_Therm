@@ -311,26 +311,31 @@ class Chiplet_package:
             if layer.is_power_src():
                 layer.map_temperature_to_blk(temperature_all_map[layer_start:layer_end], utils=self.common_utils, ts=ts)
 
-    def convert_to_np_array(self, pointer):
+    def convert_to_np_array(self, pointer, rows=None):
         def dereference_pointer(pointer, length):
             double_array = cast(pointer, POINTER(c_double * length))
             double_list = list(double_array.contents)
             return double_list
-        
-        self.temperature_all_save = [dereference_pointer(pointers,self.package_total_nodes()) for pointers in pointer]
+
+        if rows is None:
+            rows = len(pointer)
+        self.temperature_all_save = [
+            dereference_pointer(pointer[i], self.package_total_nodes())
+            for i in range(rows)
+        ]
 
     def set_initial_conditions(self):
         if not os.path.exists(self.args.output_dir + '/output'):
             os.makedirs(self.args.output_dir + '/output')
-            
+
         if self.args.simulation_type == 'steady':
             power_steps = 1
         else:
-            power_steps = int(self.args.total_duration/float(self.args.power_interval))
+            power_steps = self._count_steps(self.args.total_duration, self.args.power_interval, 'total_duration/power_interval')
         self.temperature_all_save = []
         self.temperature_all = np.zeros(self.package_total_nodes())
         self.power = np.zeros((self.package_total_nodes(), power_steps))
-        
+
         # set power for chiplet nodes
         global_iter = 0
         for layer in self.layers:
@@ -341,35 +346,101 @@ class Chiplet_package:
         np.savetxt(self.args.output_dir + '/output/power_all.csv', self.power.T, delimiter=',')
 
     def run_simulation_c_lsoda(self):
-
         total_duration = self.args.total_duration
         self.set_initial_conditions()
         power = self.power.T
-        
+
         if self.args.simulation_type == 'steady':
             dt = float(total_duration)
             power_interval = float(total_duration)
-
-            np_temperature_all = np.zeros((2, self.package_total_nodes()))
-            c_temperature_all = (POINTER(c_double) * 2)()
-            c_temperature_all[0] = (c_double * self.package_total_nodes())(*np_temperature_all[0])
-            c_temperature_all[1] = (c_double * self.package_total_nodes())(*np_temperature_all[1])
-
-            c_power = (POINTER(c_double) * 1)()
-            c_power[0] = (c_double * power.shape[1])(*power[0])
-
+            self._validate_native_inputs(power, dt, power_interval)
+            initial_temperature = np.zeros(self.package_total_nodes())
+            self.temperature_all_save = self._call_native_solver(
+                power=power,
+                output_rows=2,
+                initial_temperature=initial_temperature,
+                total_duration=total_duration,
+                dt=dt,
+                power_interval=power_interval,
+            )
         else:
-            dt = self.args.time_step
-            power_interval = self.args.power_interval
+            dt = float(self.args.time_step)
+            power_interval = float(self.args.power_interval)
+            self._validate_native_inputs(power, dt, power_interval)
+            max_native_steps = self._max_native_steps()
 
-            np_temperature_all = np.zeros((int(total_duration/dt) + 1, self.package_total_nodes()))
-            c_temperature_all = (POINTER(c_double) * (int(total_duration/dt) + 1))()
-            for i in range(int(total_duration/dt) + 1):
-                c_temperature_all[i] = (c_double * self.package_total_nodes())(*np_temperature_all[i])
+            if max_native_steps > 0 and power.shape[0] > max_native_steps:
+                self.temperature_all_save = self._run_transient_chunked(
+                    power=power,
+                    dt=dt,
+                    power_interval=power_interval,
+                    max_native_steps=max_native_steps,
+                )
+            else:
+                output_rows = self._count_steps(total_duration, dt, 'total_duration/time_step') + 1
+                initial_temperature = np.zeros(self.package_total_nodes())
+                self.temperature_all_save = self._call_native_solver(
+                    power=power,
+                    output_rows=output_rows,
+                    initial_temperature=initial_temperature,
+                    total_duration=total_duration,
+                    dt=dt,
+                    power_interval=power_interval,
+                )
 
-            c_power = (POINTER(c_double) * power.shape[0])()
-            for i in range(power.shape[0]):
-                c_power[i] = (c_double * power.shape[1])(*power[i])
+        self.write_temperature_to_file(dt)
+
+    def _run_transient_chunked(self, power, dt, power_interval, max_native_steps):
+        if not np.isclose(dt, power_interval, rtol=1e-9, atol=1e-12):
+            raise ValueError(
+                'Chunked thermal solving requires time_step and power_interval to match; '
+                f'got time_step={dt} and power_interval={power_interval}. '
+                'Set --max_native_steps 0 to use the unchunked native solver.'
+            )
+
+        total_steps = power.shape[0]
+        total_chunks = int(np.ceil(total_steps / float(max_native_steps)))
+        print(f'Running native thermal solver in {total_chunks} chunks of up to {max_native_steps} steps')
+
+        stitched_segments = []
+        initial_temperature = np.zeros(self.package_total_nodes())
+
+        for chunk_index, start in enumerate(range(0, total_steps, max_native_steps), start=1):
+            end = min(start + max_native_steps, total_steps)
+            segment_power = power[start:end]
+            segment_steps = end - start
+            print(f'Thermal native chunk {chunk_index}/{total_chunks}: steps {start + 1}-{end}')
+
+            segment_temperature = self._call_native_solver(
+                power=segment_power,
+                output_rows=segment_steps + 1,
+                initial_temperature=initial_temperature,
+                total_duration=segment_steps * dt,
+                dt=dt,
+                power_interval=power_interval,
+            )
+            segment_temperature += initial_temperature - segment_temperature[0]
+
+            if stitched_segments:
+                stitched_segments.append(segment_temperature[1:])
+            else:
+                stitched_segments.append(segment_temperature)
+            initial_temperature = segment_temperature[-1].copy()
+
+        return np.vstack(stitched_segments)
+
+    def _call_native_solver(self, power, output_rows, initial_temperature, total_duration, dt, power_interval):
+        total_nodes = self.package_total_nodes()
+        np_temperature_all = np.zeros((output_rows, total_nodes))
+        np_temperature_all[0] = np.asarray(initial_temperature, dtype=np.double)
+
+        c_temperature_all = (POINTER(c_double) * output_rows)()
+        for i in range(output_rows):
+            c_temperature_all[i] = (c_double * total_nodes)(*np_temperature_all[i])
+
+        c_power = (POINTER(c_double) * power.shape[0])()
+        for i in range(power.shape[0]):
+            c_power[i] = (c_double * power.shape[1])(*power[i])
 
         G_all = self.conductance_all
         non_zero_index = self.non_zero_index
@@ -382,15 +453,68 @@ class Chiplet_package:
         for i in range(non_zero_index.shape[0]):
             c_non_zero_index[i] = (c_int * non_zero_index.shape[1])(*non_zero_index[i])
 
-        chiplet_ode_c(c_temperature_all, c_power, 
-                      c_G_all, 
-                      c_non_zero_index, 
-                      self.capacitance_all, 
-                      self.package_total_nodes(), 
-                      self.non_zero_index.shape[1], 
-                      total_duration, dt, power_interval)
-        
+        chiplet_ode_c(
+            c_temperature_all,
+            c_power,
+            c_G_all,
+            c_non_zero_index,
+            np.ascontiguousarray(self.capacitance_all, dtype=np.double),
+            total_nodes,
+            self.non_zero_index.shape[1],
+            total_duration,
+            dt,
+            power_interval,
+        )
 
-        self.convert_to_np_array(c_temperature_all)
-        self.write_temperature_to_file(dt)
-        
+        self.convert_to_np_array(c_temperature_all, rows=output_rows)
+        return np.asarray(self.temperature_all_save, dtype=np.double)
+
+    def _validate_native_inputs(self, power, dt, power_interval):
+        total_nodes = self.package_total_nodes()
+        if dt <= 0:
+            raise ValueError(f'time_step must be positive, got {dt}')
+        if power_interval <= 0:
+            raise ValueError(f'power_interval must be positive, got {power_interval}')
+        if power.shape[1] != total_nodes:
+            raise ValueError(f'Power matrix has {power.shape[1]} nodes, expected {total_nodes}')
+        if self.args.simulation_type != 'steady':
+            expected_power_steps = self._count_steps(
+                self.args.total_duration,
+                self.args.power_interval,
+                'total_duration/power_interval',
+            )
+            if power.shape[0] != expected_power_steps:
+                raise ValueError(f'Power matrix has {power.shape[0]} rows, expected {expected_power_steps}')
+            self._count_steps(self.args.total_duration, self.args.time_step, 'total_duration/time_step')
+
+        self._require_finite_array('capacitance_all', self.capacitance_all)
+        self._require_finite_array('conductance_all', self.conductance_all)
+        self._require_finite_array('non_zero_index', self.non_zero_index)
+        self._require_finite_array('power', power)
+
+        if np.any(self.capacitance_all == 0):
+            raise ValueError('capacitance_all contains zero values')
+        if np.any(self.non_zero_index < 0) or np.any(self.non_zero_index >= total_nodes):
+            raise ValueError('non_zero_index contains node indexes outside package bounds')
+
+    def _max_native_steps(self):
+        value = getattr(self.args, 'max_native_steps', 256)
+        if value is None:
+            return 256
+        value = int(value)
+        if value < 0:
+            raise ValueError(f'max_native_steps must be non-negative, got {value}')
+        return value
+
+    @staticmethod
+    def _require_finite_array(name, values):
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f'{name} contains NaN or infinite values')
+
+    @staticmethod
+    def _count_steps(duration, interval, label):
+        raw_steps = float(duration) / float(interval)
+        steps = int(round(raw_steps))
+        if not np.isclose(raw_steps, steps, rtol=1e-9, atol=1e-9):
+            raise ValueError(f'{label} must be an integer number of steps, got {raw_steps}')
+        return steps
