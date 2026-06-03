@@ -83,6 +83,7 @@ post_processing:
     time_step_s: null
     power_interval_s: null
     total_duration_s: null
+    max_native_steps: 256
 
     # Outputs.
     generate_heatmap: true
