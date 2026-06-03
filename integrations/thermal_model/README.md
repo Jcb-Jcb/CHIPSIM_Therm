@@ -36,7 +36,9 @@ We've provided examples for each of these configurations for 2x2 - 2.5D chiplets
                        --geometry_file example_1_uniform_nodes_homogeneous_chiplets/chiplet_geometry_4_chiplets_uniform_nodes.yml \
                        --power_config_file example_1_uniform_nodes_homogeneous_chiplets/power_dist_config_homogeneous.yml \
                        --power_seq_file example_1_uniform_nodes_homogeneous_chiplets/power_seq_random_4.csv \
-                       --output_dir example_1_uniform_nodes_homogeneous_chiplets/
+                       --output_dir example_1_uniform_nodes_homogeneous_chiplets/ \
+                       --total_duration 50 \
+                       --is_homogeneous true
   ``` 
 
   Other parameters are set to default values.
@@ -55,7 +57,8 @@ We've provided examples for each of these configurations for 2x2 - 2.5D chiplets
                        --power_config_file example_2_non_uniform_nodes_homogeneous_chiplets/power_dist_config_tiles_tx_rx.yml \
                        --power_seq_file example_2_non_uniform_nodes_homogeneous_chiplets/power_seq_30s_tiles_tx_rs.csv \
                        --output_dir example_2_non_uniform_nodes_homogeneous_chiplets/ \
-                       --total_duration 30
+                       --total_duration 30 \
+                       --is_homogeneous true
   ```
   Other parameters are set to default values. 
 
@@ -81,6 +84,7 @@ We've provided examples for each of these configurations for 2x2 - 2.5D chiplets
                        --power_config_file example_3_heterogeneous_chiplets/power_dist_config_heterogeneous.yml \
                        --power_seq_file example_3_heterogeneous_chiplets/power_seq_random_3.csv \
                        --output_dir example_3_heterogeneous_chiplets/ \
+                       --total_duration 50 \
                        --is_homogeneous false
   ```
 
