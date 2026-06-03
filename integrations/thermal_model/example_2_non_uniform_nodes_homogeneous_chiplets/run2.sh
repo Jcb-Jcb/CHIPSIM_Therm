@@ -5,7 +5,8 @@ python thermal_RC.py --material_prop_file material_prop.yml \
                        --power_config_file example_2_non_uniform_nodes_homogeneous_chiplets/power_dist_config_tiles_tx_rx.yml \
                        --power_seq_file example_2_non_uniform_nodes_homogeneous_chiplets/power_seq_30s_tiles_tx_rs.csv \
                        --output_dir example_2_non_uniform_nodes_homogeneous_chiplets/ \
-                       --total_duration 30
+                       --total_duration 30 \
+                       --is_homogeneous true
 cd -
 
 #   Other parameters are set to default values. 

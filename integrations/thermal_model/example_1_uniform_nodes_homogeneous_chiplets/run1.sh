@@ -6,7 +6,9 @@ python thermal_RC.py --material_prop_file material_prop.yml \
                        --geometry_file example_1_uniform_nodes_homogeneous_chiplets/chiplet_geometry_4_chiplets_uniform_nodes.yml \
                        --power_config_file example_1_uniform_nodes_homogeneous_chiplets/power_dist_config_homogeneous.yml \
                        --power_seq_file example_1_uniform_nodes_homogeneous_chiplets/power_seq_random_4.csv \
-                       --output_dir example_1_uniform_nodes_homogeneous_chiplets/
+                       --output_dir example_1_uniform_nodes_homogeneous_chiplets/ \
+                       --total_duration 50 \
+                       --is_homogeneous true
 cd -
 # Other parameters are set to default values.
 # From output floorplan or heatmaps notice that the nodes are uniformly distributed in each layer. Still the nodes can have different granularity by changing `x_nodes`, `y_nodes` in the geometry file.
