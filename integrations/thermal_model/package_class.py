@@ -3,6 +3,8 @@ from layer_class import Layer_chiplet
 import numpy as np
 import os
 from scipy.signal import lti
+from scipy.sparse import csr_matrix, diags, hstack, vstack
+from scipy.sparse.linalg import expm_multiply
 from ctypes import *
 import platform
 
@@ -16,7 +18,8 @@ elif os_type == 'Darwin':  # for macOS dylib works
 else:  # Assume Unix/Linux
     shared_lib_ext = '.so'
 
-lib_solver = CDLL(f'c_files/chiplet_ode{shared_lib_ext}')  
+solver_dir = os.path.dirname(os.path.abspath(__file__))
+lib_solver = CDLL(os.path.join(solver_dir, 'c_files', f'chiplet_ode{shared_lib_ext}'))
 
 lib_solver.chiplet_ode.argtypes = [
     POINTER(POINTER(c_double)),  # output temperature
@@ -294,7 +297,7 @@ class Chiplet_package:
         temperature_all_map = self.temperature_all_save.T
 
         if self.args.generate_heatmap:
-            index_heatmap = int(self.args.time_heatmap/self.args.time_step)
+            index_heatmap = self._heatmap_step_index(temperature_all_map.shape[1])
             plot_temperature = temperature_all_map[:, index_heatmap] - 300.0
             num_nodes = 0
             for layer in self.layers:
@@ -354,15 +357,7 @@ class Chiplet_package:
             dt = float(total_duration)
             power_interval = float(total_duration)
             self._validate_native_inputs(power, dt, power_interval)
-            initial_temperature = np.zeros(self.package_total_nodes())
-            self.temperature_all_save = self._call_native_solver(
-                power=power,
-                output_rows=2,
-                initial_temperature=initial_temperature,
-                total_duration=total_duration,
-                dt=dt,
-                power_interval=power_interval,
-            )
+            self.temperature_all_save = self._run_steady_constant_power(power, total_duration)
         else:
             dt = float(self.args.time_step)
             power_interval = float(self.args.power_interval)
@@ -389,6 +384,37 @@ class Chiplet_package:
                 )
 
         self.write_temperature_to_file(dt)
+
+    def _run_steady_constant_power(self, power, total_duration):
+        total_nodes = self.package_total_nodes()
+        initial_temperature = np.zeros(total_nodes)
+        power_vector = np.asarray(power[-1], dtype=np.double)
+
+        conductance = self._sparse_conductance_matrix()
+        capacitance_inverse = np.asarray(self.capacitance_all, dtype=np.double)
+        system_matrix = -(diags(capacitance_inverse, format='csr') @ conductance)
+        forcing = capacitance_inverse * power_vector
+
+        augmented_matrix = vstack([
+            hstack([system_matrix, csr_matrix(forcing.reshape(-1, 1))], format='csr'),
+            csr_matrix((1, total_nodes + 1)),
+        ], format='csr')
+        augmented_initial = np.concatenate([initial_temperature, [1.0]])
+        final_temperature = expm_multiply(augmented_matrix * total_duration, augmented_initial)[:-1]
+
+        return np.vstack([initial_temperature, final_temperature])
+
+    def _sparse_conductance_matrix(self):
+        total_nodes = self.package_total_nodes()
+        non_zero_columns = self.conductance_all.shape[1]
+        row_index = np.repeat(np.arange(total_nodes), non_zero_columns)
+        column_index = self.non_zero_index.reshape(-1)
+        values = self.conductance_all.reshape(-1)
+        populated = values != 0
+        return csr_matrix(
+            (values[populated], (row_index[populated], column_index[populated])),
+            shape=(total_nodes, total_nodes),
+        )
 
     def _run_transient_chunked(self, power, dt, power_interval, max_native_steps):
         if not np.isclose(dt, power_interval, rtol=1e-9, atol=1e-12):
@@ -435,32 +461,50 @@ class Chiplet_package:
         np_temperature_all[0] = np.asarray(initial_temperature, dtype=np.double)
 
         c_temperature_all = (POINTER(c_double) * output_rows)()
+        temperature_rows = []
         for i in range(output_rows):
-            c_temperature_all[i] = (c_double * total_nodes)(*np_temperature_all[i])
+            row = (c_double * total_nodes)(*np_temperature_all[i])
+            temperature_rows.append(row)
+            c_temperature_all[i] = row
 
+        power = np.ascontiguousarray(power, dtype=np.double)
+        if power.shape[0] < output_rows:
+            pad_rows = output_rows - power.shape[0]
+            power = np.vstack([power, np.repeat(power[-1:], pad_rows, axis=0)])
         c_power = (POINTER(c_double) * power.shape[0])()
+        power_rows = []
         for i in range(power.shape[0]):
-            c_power[i] = (c_double * power.shape[1])(*power[i])
+            row = (c_double * power.shape[1])(*power[i])
+            power_rows.append(row)
+            c_power[i] = row
 
-        G_all = self.conductance_all
-        non_zero_index = self.non_zero_index
+        G_all = np.ascontiguousarray(self.conductance_all, dtype=np.double)
+        non_zero_index = np.ascontiguousarray(self.non_zero_index, dtype=np.intc)
 
         c_G_all = (POINTER(c_double) * G_all.shape[0])()
+        conductance_rows = []
         for i in range(G_all.shape[0]):
-            c_G_all[i] = (c_double * G_all.shape[1])(*G_all[i])
+            row = (c_double * G_all.shape[1])(*G_all[i])
+            conductance_rows.append(row)
+            c_G_all[i] = row
 
         c_non_zero_index = (POINTER(c_int) * non_zero_index.shape[0])()
+        non_zero_index_rows = []
         for i in range(non_zero_index.shape[0]):
-            c_non_zero_index[i] = (c_int * non_zero_index.shape[1])(*non_zero_index[i])
+            row = (c_int * non_zero_index.shape[1])(*non_zero_index[i])
+            non_zero_index_rows.append(row)
+            c_non_zero_index[i] = row
+
+        capacitance = np.ascontiguousarray(self.capacitance_all, dtype=np.double)
 
         chiplet_ode_c(
             c_temperature_all,
             c_power,
             c_G_all,
             c_non_zero_index,
-            np.ascontiguousarray(self.capacitance_all, dtype=np.double),
+            capacitance,
             total_nodes,
-            self.non_zero_index.shape[1],
+            non_zero_index.shape[1],
             total_duration,
             dt,
             power_interval,
@@ -468,6 +512,22 @@ class Chiplet_package:
 
         self.convert_to_np_array(c_temperature_all, rows=output_rows)
         return np.asarray(self.temperature_all_save, dtype=np.double)
+
+    def _heatmap_step_index(self, output_columns):
+        if self.args.simulation_type == 'steady':
+            return output_columns - 1
+
+        index = self._count_steps(
+            self.args.time_heatmap,
+            self.args.time_step,
+            'time_heatmap/time_step',
+        )
+        if index < 0 or index >= output_columns:
+            raise ValueError(
+                f'time_heatmap index {index} is outside available temperature steps '
+                f'0..{output_columns - 1}'
+            )
+        return index
 
     def _validate_native_inputs(self, power, dt, power_interval):
         total_nodes = self.package_total_nodes()
