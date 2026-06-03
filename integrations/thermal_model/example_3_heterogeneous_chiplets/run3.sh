@@ -15,5 +15,6 @@ python thermal_RC.py --material_prop_file material_prop.yml \
                        --power_config_file example_3_heterogeneous_chiplets/power_dist_config_heterogeneous.yml \
                        --power_seq_file example_3_heterogeneous_chiplets/power_seq_random_3.csv \
                        --output_dir example_3_heterogeneous_chiplets/ \
+                       --total_duration 50 \
                        --is_homogeneous false
 cd -
