@@ -3,8 +3,8 @@ from layer_class import Layer_chiplet
 import numpy as np
 import os
 from scipy.signal import lti
-from scipy.sparse import csr_matrix, diags, hstack, vstack
-from scipy.sparse.linalg import expm_multiply
+from scipy.sparse import csr_matrix, diags, hstack, identity, vstack
+from scipy.sparse.linalg import expm_multiply, factorized
 from ctypes import *
 import platform
 
@@ -364,7 +364,13 @@ class Chiplet_package:
             self._validate_native_inputs(power, dt, power_interval)
             max_native_steps = self._max_native_steps()
 
-            if max_native_steps > 0 and power.shape[0] > max_native_steps:
+            if self._use_python_transient_solver():
+                self.temperature_all_save = self._run_transient_python(
+                    power=power,
+                    dt=dt,
+                    power_interval=power_interval,
+                )
+            elif max_native_steps > 0 and power.shape[0] > max_native_steps:
                 self.temperature_all_save = self._run_transient_chunked(
                     power=power,
                     dt=dt,
@@ -415,6 +421,43 @@ class Chiplet_package:
             (values[populated], (row_index[populated], column_index[populated])),
             shape=(total_nodes, total_nodes),
         )
+
+    def _use_python_transient_solver(self):
+        total_nodes = self.package_total_nodes()
+        non_zero_columns = self.non_zero_index.shape[1]
+        return total_nodes >= 512 or non_zero_columns > 12
+
+    def _run_transient_python(self, power, dt, power_interval):
+        if not np.isclose(dt, power_interval, rtol=1e-9, atol=1e-12):
+            raise ValueError(
+                'Python transient thermal solving currently requires time_step and power_interval to match; '
+                f'got time_step={dt} and power_interval={power_interval}.'
+            )
+
+        total_nodes = self.package_total_nodes()
+        total_steps = power.shape[0]
+        print(
+            'Using Python transient thermal solver: '
+            f'total_nodes={total_nodes}, steps={total_steps}, '
+            f'non_zero_columns={self.non_zero_index.shape[1]}, method=backward_euler',
+            flush=True,
+        )
+
+        conductance = self._sparse_conductance_matrix()
+        capacitance_inverse = np.asarray(self.capacitance_all, dtype=np.double)
+        system_matrix = -(diags(capacitance_inverse, format='csr') @ conductance)
+        step_matrix = (identity(total_nodes, format='csc') - dt * system_matrix).tocsc()
+        solve_step = factorized(step_matrix)
+
+        temperatures = np.zeros((total_steps + 1, total_nodes), dtype=np.double)
+        state = temperatures[0].copy()
+
+        for step, power_vector in enumerate(np.asarray(power, dtype=np.double), start=1):
+            forcing = capacitance_inverse * power_vector
+            state = solve_step(state + dt * forcing)
+            temperatures[step] = state
+
+        return temperatures
 
     def _run_transient_chunked(self, power, dt, power_interval, max_native_steps):
         if not np.isclose(dt, power_interval, rtol=1e-9, atol=1e-12):
