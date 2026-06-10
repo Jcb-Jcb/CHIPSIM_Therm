@@ -17,28 +17,49 @@ class Power_block:
 
     def create_power_seq(self, layer_name, chiplet_name, power_seq):
         found_flag = False
+        power_sq_name = layer_name + '_' + chiplet_name + '_' + self.name
         for i in range(0, len(power_seq)):
-            power_sq_name =  layer_name + '_' + chiplet_name + '_' + self.name
             if power_seq[i][0] == power_sq_name:
                 self.power_seq = power_seq[i][1:]
                 found_flag = True
                 break
         
         if not found_flag:
-            print('Power sequence not found for block: ', layer_name + '_' + chiplet_name + '_' + self.name)
-            return
+            raise ValueError(f'Power sequence not found for block: {power_sq_name}')
         
         # power seq is in percentage, convert to float
+        try:
+            power_seq_percent = [float(i) for i in self.power_seq]
+        except ValueError as exc:
+            raise ValueError(f'Power sequence for block {power_sq_name} contains a non-numeric value') from exc
+
         if self.args.simulation_type == 'steady':
-            self.power_seq = np.array([1])
+            step_index = self._steady_power_step_index(len(power_seq_percent))
+            self.power_seq = np.array([power_seq_percent[step_index]/100.0])
         else:
-            self.power_seq = np.array([float(i)/100.0 for i in self.power_seq])
+            self.power_seq = np.array([i/100.0 for i in power_seq_percent])
 
         # print
         # print('Power sequence for node: ', layer , '_', self.name, ' is: ', self.power_seq)
 
     def get_area(self):
         return self.length_x * self.length_y
+
+    def _steady_power_step_index(self, sequence_length):
+        if sequence_length <= 0:
+            return 0
+
+        try:
+            time_heatmap = float(self.args.time_heatmap)
+            time_step = float(self.args.time_step)
+        except (AttributeError, TypeError, ValueError):
+            return sequence_length - 1
+
+        if time_step <= 0:
+            return sequence_length - 1
+
+        step_index = int(round(time_heatmap/time_step))
+        return min(max(step_index, 0), sequence_length - 1)
 
 class Power_chiplet:
     def __init__(self, power_chiplet_dict, name, args):
@@ -125,17 +146,134 @@ class Power_grid:
 
         with open(self.args.power_seq_file, 'r') as f:
             reader = csv.reader(f)
-            self.power_seq = list(reader)
+            self.power_seq = [row for row in reader if row]
         
         self.power_layers = []
         for layer in self.power_dict:
             power_layer = Power_layer(self.power_dict, layer, self.args)
             self.power_layers.append(power_layer)
+
+        self._validate_power_sequence()
     
     def create_power_seq_grid(self, utils):
         for layer in self.power_layers:
             layer.plot_layer(utils)
             layer.create_power_seq_layer(self.power_seq)
+
+    def _validate_power_sequence(self):
+        if not self.power_seq:
+            raise ValueError(f'Power sequence file is empty: {self.args.power_seq_file}')
+
+        row_by_name = {}
+        sequence_steps = None
+
+        for row_number, row in enumerate(self.power_seq, start=1):
+            row[0] = row[0].strip()
+            row_name = row[0]
+            if not row_name:
+                raise ValueError(f'Power sequence row {row_number} has an empty block name')
+            if row_name in row_by_name:
+                raise ValueError(
+                    f'Duplicate power sequence row for block {row_name}: '
+                    f'rows {row_by_name[row_name]} and {row_number}'
+                )
+            row_by_name[row_name] = row_number
+
+            row_steps = len(row) - 1
+            if row_steps <= 0:
+                raise ValueError(f'Power sequence row {row_name} has no timestep values')
+            if sequence_steps is None:
+                sequence_steps = row_steps
+            elif row_steps != sequence_steps:
+                raise ValueError(
+                    f'Power sequence row {row_name} has {row_steps} steps, '
+                    f'expected {sequence_steps}'
+                )
+
+            for value_index, value in enumerate(row[1:], start=1):
+                try:
+                    numeric_value = float(value)
+                except ValueError as exc:
+                    raise ValueError(
+                        f'Power sequence row {row_name}, step {value_index} '
+                        f'is not numeric: {value!r}'
+                    ) from exc
+                if not np.isfinite(numeric_value):
+                    raise ValueError(
+                        f'Power sequence row {row_name}, step {value_index} '
+                        f'is not finite: {value!r}'
+                    )
+
+        expected_names = self._expected_power_sequence_names()
+        expected_name_set = set(expected_names)
+        missing_names = [name for name in expected_names if name not in row_by_name]
+        extra_names = sorted(name for name in row_by_name if name not in expected_name_set)
+
+        if missing_names:
+            raise ValueError(
+                f'Power sequence is missing {len(missing_names)} required rows: '
+                f'{self._preview_names(missing_names)}'
+            )
+        if extra_names:
+            raise ValueError(
+                f'Power sequence has {len(extra_names)} rows not present in the power config: '
+                f'{self._preview_names(extra_names)}'
+            )
+
+        if self.args.simulation_type == 'steady':
+            self._validate_steady_heatmap_index(sequence_steps)
+        else:
+            expected_steps = self._count_steps(
+                self.args.total_duration,
+                self.args.power_interval,
+                'total_duration/power_interval',
+            )
+            if sequence_steps != expected_steps:
+                raise ValueError(
+                    f'Power sequence has {sequence_steps} steps, expected {expected_steps} '
+                    f'from total_duration/power_interval '
+                    f'({self.args.total_duration}/{self.args.power_interval})'
+                )
+
+    def _expected_power_sequence_names(self):
+        names = []
+        for layer in self.power_layers:
+            for chiplet in layer.power_chiplets:
+                for block in chiplet.power_blocks:
+                    names.append(layer.name + '_' + chiplet.name + '_' + block.name)
+        return names
+
+    def _validate_steady_heatmap_index(self, sequence_steps):
+        try:
+            time_heatmap = float(self.args.time_heatmap)
+            time_step = float(self.args.time_step)
+        except (AttributeError, TypeError, ValueError):
+            return
+
+        if time_step <= 0:
+            raise ValueError(f'time_step must be positive, got {time_step}')
+
+        step_index = int(round(time_heatmap/time_step))
+        if step_index < 0 or step_index > sequence_steps:
+            raise ValueError(
+                f'steady time_heatmap selects power sequence index {step_index}, '
+                f'outside valid range 0..{sequence_steps}'
+            )
+
+    @staticmethod
+    def _count_steps(duration, interval, label):
+        raw_steps = float(duration) / float(interval)
+        steps = int(round(raw_steps))
+        if not np.isclose(raw_steps, steps, rtol=1e-9, atol=1e-9):
+            raise ValueError(f'{label} must be an integer number of steps, got {raw_steps}')
+        return steps
+
+    @staticmethod
+    def _preview_names(names, limit=5):
+        preview = ', '.join(names[:limit])
+        if len(names) > limit:
+            preview += ', ...'
+        return preview
 
 if __name__ == '__main__':
     power_config_dict = common.load_dict_yaml('power_dist_config.yml')

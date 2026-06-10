@@ -497,6 +497,17 @@ class Chiplet_package:
 
         capacitance = np.ascontiguousarray(self.capacitance_all, dtype=np.double)
 
+        self._print_native_solver_debug(
+            power=power,
+            output_rows=output_rows,
+            total_duration=total_duration,
+            dt=dt,
+            power_interval=power_interval,
+            G_all=G_all,
+            non_zero_index=non_zero_index,
+            capacitance=capacitance,
+        )
+
         chiplet_ode_c(
             c_temperature_all,
             c_power,
@@ -512,6 +523,33 @@ class Chiplet_package:
 
         self.convert_to_np_array(c_temperature_all, rows=output_rows)
         return np.asarray(self.temperature_all_save, dtype=np.double)
+
+    def _print_native_solver_debug(self, power, output_rows, total_duration, dt, power_interval, G_all, non_zero_index, capacitance):
+        non_zero_min, non_zero_max = self._array_min_max(non_zero_index)
+        capacitance_min, capacitance_max = self._array_min_max(capacitance)
+        print(
+            'Native thermal solver input: '
+            f'total_nodes={self.package_total_nodes()}, '
+            f'output_rows={output_rows}, '
+            f'power_shape={power.shape}, '
+            f'conductance_shape={G_all.shape}, '
+            f'non_zero_index_shape={non_zero_index.shape}, '
+            f'non_zero_columns={non_zero_index.shape[1] if non_zero_index.ndim == 2 else "n/a"}, '
+            f'non_zero_index_min={non_zero_min}, '
+            f'non_zero_index_max={non_zero_max}, '
+            f'capacitance_min={capacitance_min}, '
+            f'capacitance_max={capacitance_max}, '
+            f'total_duration={total_duration}, '
+            f'time_step={dt}, '
+            f'power_interval={power_interval}',
+            flush=True,
+        )
+
+    @staticmethod
+    def _array_min_max(values):
+        if np.size(values) == 0:
+            return 'n/a', 'n/a'
+        return np.min(values), np.max(values)
 
     def _heatmap_step_index(self, output_columns):
         if self.args.simulation_type == 'steady':
@@ -531,12 +569,36 @@ class Chiplet_package:
 
     def _validate_native_inputs(self, power, dt, power_interval):
         total_nodes = self.package_total_nodes()
+        power = np.asarray(power)
+
         if dt <= 0:
             raise ValueError(f'time_step must be positive, got {dt}')
         if power_interval <= 0:
             raise ValueError(f'power_interval must be positive, got {power_interval}')
+        if power.ndim != 2:
+            raise ValueError(f'Power matrix must be 2D, got shape {power.shape}')
+        if power.shape[0] <= 0:
+            raise ValueError('Power matrix must contain at least one timestep row')
         if power.shape[1] != total_nodes:
             raise ValueError(f'Power matrix has {power.shape[1]} nodes, expected {total_nodes}')
+        if np.asarray(self.capacitance_all).shape != (total_nodes,):
+            raise ValueError(
+                f'capacitance_all has shape {np.asarray(self.capacitance_all).shape}, '
+                f'expected ({total_nodes},)'
+            )
+        if np.asarray(self.conductance_all).ndim != 2:
+            raise ValueError(f'conductance_all must be 2D, got shape {np.asarray(self.conductance_all).shape}')
+        if np.asarray(self.non_zero_index).ndim != 2:
+            raise ValueError(f'non_zero_index must be 2D, got shape {np.asarray(self.non_zero_index).shape}')
+        if self.conductance_all.shape != self.non_zero_index.shape:
+            raise ValueError(
+                f'conductance_all shape {self.conductance_all.shape} does not match '
+                f'non_zero_index shape {self.non_zero_index.shape}'
+            )
+        if self.conductance_all.shape[0] != total_nodes:
+            raise ValueError(
+                f'conductance_all has {self.conductance_all.shape[0]} rows, expected {total_nodes}'
+            )
         if self.args.simulation_type != 'steady':
             expected_power_steps = self._count_steps(
                 self.args.total_duration,
